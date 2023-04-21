@@ -1,28 +1,6 @@
-#include <TensorFlowLite.h>
-
-/*
-  IMU Classifier
-  This example uses the on-board IMU to start reading acceleration and gyroscope
-  data from on-board IMU, once enough samples are read, it then uses a
-  TensorFlow Lite (Micro) model to try to classify the movement as a known gesture.
-  Note: The direct use of C/C++ pointers, namespaces, and dynamic memory is generally
-        discouraged in Arduino examples, and in the future the TensorFlowLite library
-        might change to make the sketch simpler.
-  The circuit:
-  - Arduino Nano 33 BLE or Arduino Nano 33 BLE Sense board.
-  Created by Don Coleman, Sandeep Mistry
-  Modified by Dominic Pajak, Sandeep Mistry
-  This example code is in the public domain.
-*/
-
 #include <Arduino_LSM9DS1.h>
 #include <TensorFlowLite.h>
 
-#include "accelerometer_handler.h"
-#include "constants.h"
-#include "gesture_predictor.h"
-#include "magic_wand_model_data.h"
-#include "output_handler.h"
 #include "tensorflow/lite/micro/kernels/micro_ops.h"
 #include "tensorflow/lite/micro/micro_error_reporter.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
@@ -32,26 +10,22 @@
 
 #include "model.h"
 
-const float accelerationThreshold = 2.5; // threshold of significant in G's
+const float threshold = 2.5; // Sensitivity
 const int numSamples = 119;
 
 int samplesRead = numSamples;
 
-// global variables used for TensorFlow Lite (Micro)
-tflite::ErrorReporter* tflErrorReporter;
+// Error Reporter
+tflite::ErrorReporter* errorReporter;
 
-// pull in all the TFLM ops, you can remove this line and
-// only pull in the TFLM ops you need, if would like to reduce
-// the compiled size of the sketch.
-tflite::AllOpsResolver tflOpsResolver;
 
 const tflite::Model* tflModel = nullptr;
-tflite::MicroInterpreter* tflInterpreter = nullptr;
-TfLiteTensor* tflInputTensor = nullptr;
-TfLiteTensor* tflOutputTensor = nullptr;
+tflite::MicroInterpreter* interpreter = nullptr;
+TfLiteTensor* inputTensor = nullptr;
+TfLiteTensor* outputTensor = nullptr;
 
 // Create a static memory buffer for TFLM, the size may need to
-// be adjusted based on the model you are using
+// be adjusted based on the tflModel you are using
 constexpr int tensorArenaSize = 8 * 1024;
 byte tensorArena[tensorArenaSize] __attribute__((aligned(16)));
 
@@ -66,8 +40,6 @@ const char* GESTURES[] = {
 void setup() {
   Serial.begin(9600);
   while (!Serial);
-
-  // initialize the IMU
   if (!IMU.begin()) {
     Serial.println("Failed to initialize IMU!");
     while (1);
@@ -80,25 +52,39 @@ void setup() {
   Serial.print("Gyroscope sample rate = ");
   Serial.print(IMU.gyroscopeSampleRate());
   Serial.println(" Hz");
-
   Serial.println();
 
-  // get the TFL representation of the model byte array
+
+  // get the TFL representation of the tflModel byte array
   tflModel = tflite::GetModel(model);
   if (tflModel->version() != TFLITE_SCHEMA_VERSION) {
-    Serial.println("Model schema mismatch!");
+    Serial.println("tflModel schema mismatch!");
     while (1);
   }
+  
 
-  // Create an interpreter to run the model
-  tflInterpreter = new tflite::MicroInterpreter(tflModel, tflOpsResolver, tensorArena, tensorArenaSize, &tflErrorReporter);
+  static tflite::MicroOpResolver<5> micro_op_resolver;  // NOLINT
+  micro_op_resolver.AddBuiltin(
+      tflite::BuiltinOperator_DEPTHWISE_CONV_2D,
+      tflite::ops::micro::Register_DEPTHWISE_CONV_2D());
+  micro_op_resolver.AddBuiltin(tflite::BuiltinOperator_MAX_POOL_2D,
+                               tflite::ops::micro::Register_MAX_POOL_2D());
+  micro_op_resolver.AddBuiltin(tflite::BuiltinOperator_CONV_2D,
+                               tflite::ops::micro::Register_CONV_2D());
+  micro_op_resolver.AddBuiltin(tflite::BuiltinOperator_FULLY_CONNECTED,
+                               tflite::ops::micro::Register_FULLY_CONNECTED());
+  micro_op_resolver.AddBuiltin(tflite::BuiltinOperator_SOFTMAX,
+                               tflite::ops::micro::Register_SOFTMAX());
 
-  // Allocate memory for the model's input and output tensors
-  tflInterpreter->AllocateTensors();
+  // Create an interpreter to run the tflModel
+  interpreter = new tflite::MicroInterpreter(tflModel, micro_op_resolver, tensorArena, tensorArenaSize, errorReporter);
 
-  // Get pointers for the model's input and output tensors
-  tflInputTensor = tflInterpreter->input(0);
-  tflOutputTensor = tflInterpreter->output(0);
+  // Allocate memory for the tflModel's input and output tensors
+  interpreter->AllocateTensors();
+
+  // Get pointers for the tflModel's input and output tensors
+  inputTensor = interpreter->input(0);
+  outputTensor = interpreter->output(0);
 }
 
 void loop() {
@@ -114,7 +100,7 @@ void loop() {
       float aSum = fabs(aX) + fabs(aY) + fabs(aZ);
 
       // check if it's above the threshold
-      if (aSum >= accelerationThreshold) {
+      if (aSum >= threshold) {
         // reset the sample read count
         samplesRead = 0;
         break;
@@ -131,31 +117,31 @@ void loop() {
       IMU.readAcceleration(aX, aY, aZ);
       IMU.readGyroscope(gX, gY, gZ);
 
-      // normalize the IMU data between 0 to 1 and store in the model's
+      // normalize the IMU data between 0 to 1 and store in the tflModel's
       // input tensor
-      tflInputTensor->data.f[samplesRead * 6 + 0] = (aX + 4.0) / 8.0;
-      tflInputTensor->data.f[samplesRead * 6 + 1] = (aY + 4.0) / 8.0;
-      tflInputTensor->data.f[samplesRead * 6 + 2] = (aZ + 4.0) / 8.0;
-      tflInputTensor->data.f[samplesRead * 6 + 3] = (gX + 2000.0) / 4000.0;
-      tflInputTensor->data.f[samplesRead * 6 + 4] = (gY + 2000.0) / 4000.0;
-      tflInputTensor->data.f[samplesRead * 6 + 5] = (gZ + 2000.0) / 4000.0;
+      inputTensor->data.f[samplesRead * 6 + 0] = (aX + 4.0) / 8.0;
+      inputTensor->data.f[samplesRead * 6 + 1] = (aY + 4.0) / 8.0;
+      inputTensor->data.f[samplesRead * 6 + 2] = (aZ + 4.0) / 8.0;
+      inputTensor->data.f[samplesRead * 6 + 3] = (gX + 2000.0) / 4000.0;
+      inputTensor->data.f[samplesRead * 6 + 4] = (gY + 2000.0) / 4000.0;
+      inputTensor->data.f[samplesRead * 6 + 5] = (gZ + 2000.0) / 4000.0;
 
       samplesRead++;
 
       if (samplesRead == numSamples) {
         // Run inferencing
-        TfLiteStatus invokeStatus = tflInterpreter->Invoke();
+        TfLiteStatus invokeStatus = interpreter->Invoke();
         if (invokeStatus != kTfLiteOk) {
           Serial.println("Invoke failed!");
           while (1);
           return;
         }
 
-        // Loop through the output tensor values from the model
+        // Loop through the output tensor values from the tflModel
         for (int i = 0; i < NUM_GESTURES; i++) {
           Serial.print(GESTURES[i]);
           Serial.print(": ");
-          Serial.println(tflOutputTensor->data.f[i], 6);
+          Serial.println(outputTensor->data.f[i], 6);
         }
         Serial.println();
       }
