@@ -1,2 +1,2 @@
-# vip-spring-2023 
-Machine Learning on Arduino
+# Machine Learning on Arduino -- Vip Spring 2023 
+
