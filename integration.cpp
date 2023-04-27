@@ -81,8 +81,8 @@ Function Name: get_position(...)
 
 float get_position(float data[], int data_size, float dt)
 {
-  float integral = integrate(data, data_size, dt);
-  integral = integral * dt * data_size;
+  float integral = integrate(data, data_size, dt);	// get change in velocity
+  integral = integral * dt * data_size;	// change in position = change in time * change in velocity
   return integral;
 }
 
